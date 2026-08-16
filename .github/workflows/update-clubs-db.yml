@@ -1,0 +1,107 @@
+name: Update Clubs Database
+
+# Cron décalé par rapport à update-fide-db.yml (jour 2) pour ne pas cumuler
+# les deux runs FIDE + Clubs au même moment.
+on:
+  schedule:
+    - cron: '41 7 5 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-clubs-db:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Build clubs.txt
+        run: |
+          MAX_TRIES=5
+          for i in $(seq 1 $MAX_TRIES); do
+            if python3 scripts/process_clubs.py; then
+              echo "OK - succes a la tentative $i/$MAX_TRIES"
+              exit 0
+            fi
+            echo "Echec tentative $i/$MAX_TRIES"
+            if [ "$i" -lt "$MAX_TRIES" ]; then
+              WAIT=$((i * 90))
+              echo "Nouvelle tentative dans ${WAIT}s (probable blocage/congestion reseau cote FFE)..."
+              sleep "$WAIT"
+            fi
+          done
+          echo "ERREUR: echec apres $MAX_TRIES tentatives - la FFE ne repond pas correctement depuis les runners GitHub"
+          exit 1
+
+      - name: Validate clubs file
+        run: |
+          python3 - <<'PYEOF'
+          import os, sys, datetime
+
+          FILE = 'clubs.txt'
+          if not os.path.exists(FILE):
+              print(f"ERREUR: {FILE} introuvable"); sys.exit(1)
+
+          with open(FILE, encoding='utf-8') as f:
+              lines = [l for l in f if l.strip() and not l.startswith('#')]
+          count = max(len(lines) - 1, 0)  # -1 pour l'en-tete "ClubRef\tClub"
+
+          size = os.path.getsize(FILE)
+          print(f"  Clubs  : {count:,}")
+          print(f"  Taille : {size / 1024:.1f} KB")
+
+          if count < 900:
+              print(f"ERREUR: Fichier suspect ({count} clubs, attendu > 900)"); sys.exit(1)
+          if size < 20_000:
+              print(f"ERREUR: Fichier trop petit ({size} octets)"); sys.exit(1)
+
+          with open('clubs_stats.txt', 'w') as f:
+              f.write(f"{count}\n{datetime.date.today().isoformat()}\n")
+          print("Validation reussie")
+          PYEOF
+
+      - name: Read stats
+        id: stats
+        run: |
+          TOTAL=$(sed -n '1p' clubs_stats.txt)
+          DATE=$(sed -n '2p' clubs_stats.txt)
+          SIZE=$(du -sh clubs.txt | cut -f1)
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "date=$DATE"   >> $GITHUB_OUTPUT
+          echo "size=$SIZE"   >> $GITHUB_OUTPUT
+
+      - name: Delete existing release (if any)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_ID=$(gh release view clubs-latest --json id -q '.id' 2>/dev/null || echo "")
+          if [ -n "$RELEASE_ID" ]; then
+            gh release delete clubs-latest --yes --cleanup-tag 2>/dev/null || true
+            sleep 3
+          fi
+
+      - name: Create release and upload asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE="${{ steps.stats.outputs.date }}"
+          TOTAL="${{ steps.stats.outputs.total }}"
+          SIZE="${{ steps.stats.outputs.size }}"
+          gh release create clubs-latest \
+            --title "Clubs FFE - ${DATE}" \
+            --notes "## Clubs FFE ${DATE} | Clubs: ${TOTAL} | Taille: ${SIZE}" \
+            --latest \
+            "clubs.txt"
+
+      - name: Job summary
+        run: |
+          echo "## Clubs FFE - ${{ steps.stats.outputs.date }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Clubs total | ${{ steps.stats.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Taille | ${{ steps.stats.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
