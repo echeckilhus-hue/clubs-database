@@ -2,45 +2,74 @@ name: Update Clubs Database
 
 # Cron décalé par rapport à update-fide-db.yml (jour 2) pour ne pas cumuler
 # les deux runs FIDE + Clubs au même moment.
+#
+# Tentatives automatiques : chaque tentative ("build", matrice exécutée une à
+# une) tourne sur une NOUVELLE VM GitHub, donc potentiellement avec une autre
+# IP source — exactement ce que faisait une relance manuelle. Un retry à
+# l'intérieur d'un même job ne peut pas changer d'IP.
+# Une tentative en échec n'est pas bloquante (continue-on-error) : le run
+# n'est rouge que si TOUTES les tentatives ont échoué. La release n'est
+# remplacée qu'une fois, par le job "publish", avec un fichier déjà validé.
 on:
   schedule:
     - cron: '41 7 5 * *'
   workflow_dispatch:
 
-permissions:
-  contents: write
+# Un lancement manuel et le cron ne publient jamais en même temps.
+concurrency:
+  group: update-clubs-db
+  cancel-in-progress: false
+
+permissions: {}
 
 jobs:
-  update-clubs-db:
+  build:
+    name: Tentative ${{ matrix.attempt }}/${{ strategy.job-total }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        attempt: [1, 2, 3, 4, 5]
     steps:
+      - name: Previous attempt already succeeded?
+        id: check
+        if: matrix.attempt > 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FOUND=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+                    --jq '[.artifacts[] | select(.name == "clubs-db")] | length' || echo 0)
+          if [ "${FOUND:-0}" -gt 0 ]; then
+            echo "clubs.txt deja construit par une tentative precedente - rien a faire"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait before retrying
+        if: steps.check.outputs.skip != 'true' && matrix.attempt > 1
+        run: sleep 60
+
       - name: Checkout
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v7.0.1
 
       - name: Setup Python
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.11'
 
       - name: Build clubs.txt
-        run: |
-          MAX_TRIES=5
-          for i in $(seq 1 $MAX_TRIES); do
-            if python3 scripts/process_clubs.py; then
-              echo "OK - succes a la tentative $i/$MAX_TRIES"
-              exit 0
-            fi
-            echo "Echec tentative $i/$MAX_TRIES"
-            if [ "$i" -lt "$MAX_TRIES" ]; then
-              WAIT=$((i * 90))
-              echo "Nouvelle tentative dans ${WAIT}s (probable blocage/congestion reseau cote FFE)..."
-              sleep "$WAIT"
-            fi
-          done
-          echo "ERREUR: echec apres $MAX_TRIES tentatives - la FFE ne repond pas correctement depuis les runners GitHub"
-          exit 1
+        if: steps.check.outputs.skip != 'true'
+        run: python3 scripts/process_clubs.py
 
       - name: Validate clubs file
+        if: steps.check.outputs.skip != 'true'
         run: |
           python3 - <<'PYEOF'
           import os, sys, datetime
@@ -63,45 +92,91 @@ jobs:
               print(f"ERREUR: Fichier trop petit ({size} octets)"); sys.exit(1)
 
           with open('clubs_stats.txt', 'w') as f:
-              f.write(f"{count}\n{datetime.date.today().isoformat()}\n")
+              f.write(f"{count}\n{datetime.date.today().isoformat()}\n{size / 1024:.1f} KB\n")
           print("Validation reussie")
           PYEOF
+
+      - name: Upload clubs.txt
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: clubs-db
+          path: |
+            clubs.txt
+            clubs_stats.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download clubs.txt
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: clubs-db
+
+      - name: Fail if every attempt failed
+        if: steps.download.outcome != 'success'
+        run: |
+          echo "::error::Toutes les tentatives ont echoue - la FFE ne repond pas correctement depuis les runners GitHub (voir les jobs 'Tentative x/y'). La release precedente est conservee."
+          exit 1
 
       - name: Read stats
         id: stats
         run: |
-          TOTAL=$(sed -n '1p' clubs_stats.txt)
-          DATE=$(sed -n '2p' clubs_stats.txt)
-          SIZE=$(du -sh clubs.txt | cut -f1)
-          echo "total=$TOTAL" >> $GITHUB_OUTPUT
-          echo "date=$DATE"   >> $GITHUB_OUTPUT
-          echo "size=$SIZE"   >> $GITHUB_OUTPUT
+          {
+            echo "total=$(sed -n '1p' clubs_stats.txt)"
+            echo "date=$(sed -n '2p' clubs_stats.txt)"
+            echo "size=$(sed -n '3p' clubs_stats.txt)"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Delete existing release (if any)
+      - name: Replace release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATE: ${{ steps.stats.outputs.date }}
+          TOTAL: ${{ steps.stats.outputs.total }}
+          SIZE: ${{ steps.stats.outputs.size }}
         run: |
-          RELEASE_ID=$(gh release view clubs-latest --json id -q '.id' 2>/dev/null || echo "")
-          if [ -n "$RELEASE_ID" ]; then
-            gh release delete clubs-latest --yes --cleanup-tag 2>/dev/null || true
+          TITLE="Clubs FFE - ${DATE}"
+          NOTES="## Clubs FFE ${DATE} | Clubs: ${TOTAL} | Taille: ${SIZE}"
+          if gh release view clubs-latest >/dev/null 2>&1; then
+            gh release delete clubs-latest --yes --cleanup-tag
             sleep 3
           fi
+          for i in 1 2 3; do
+            if gh release create clubs-latest --target "$GITHUB_SHA" \
+                 --title "$TITLE" --notes "$NOTES" --latest clubs.txt; then
+              exit 0
+            fi
+            echo "Creation de la release echouee (tentative $i/3)"
+            sleep 10
+          done
+          exit 1
 
-      - name: Create release and upload asset
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # GitHub désactive les workflows planifiés d'un dépôt public après 60 jours
+      # sans activité : sans commit régulier, le cron mensuel s'arrêterait tout
+      # seul. Ré-activer le workflow via l'API remet ce compteur à zéro.
+      - name: Keep the monthly schedule alive
         run: |
-          DATE="${{ steps.stats.outputs.date }}"
-          TOTAL="${{ steps.stats.outputs.total }}"
-          SIZE="${{ steps.stats.outputs.size }}"
-          gh release create clubs-latest \
-            --title "Clubs FFE - ${DATE}" \
-            --notes "## Clubs FFE ${DATE} | Clubs: ${TOTAL} | Taille: ${SIZE}" \
-            --latest \
-            "clubs.txt"
+          gh api -X PUT "repos/${GH_REPO}/actions/workflows/update-clubs-db.yml/enable" \
+            || echo "::warning::Impossible de reinitialiser le compteur d'inactivite du cron"
 
       - name: Job summary
         run: |
-          echo "## Clubs FFE - ${{ steps.stats.outputs.date }}" >> $GITHUB_STEP_SUMMARY
-          echo "| Clubs total | ${{ steps.stats.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Taille | ${{ steps.stats.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Clubs FFE - ${{ steps.stats.outputs.date }}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Clubs total | ${{ steps.stats.outputs.total }} |"
+            echo "| Taille | ${{ steps.stats.outputs.size }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

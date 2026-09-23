@@ -21,9 +21,13 @@ vérifiée sur un comité réellement paginé (aucun comité testé manuellement
 n'en avait besoin). À surveiller sur les premières exécutions réelles,
 en particulier les gros comités (75, 92, 93, 94, 59...).
 
-Chaque comité est traité individuellement : une erreur réseau ou une page
-vide sur UN comité est loggée et ignorée, elle ne fait pas échouer tout le
-run (cf. résumé "comités vides / en erreur" en fin d'exécution). Le run
+Chaque requête HTTP est réessayée (MAX_RETRIES) en cas d'erreur réseau, de
+réponse tronquée, d'erreur 5xx ou de 429 : un raté ponctuel de la FFE ne
+coûte plus un comité entier.
+
+Chaque comité est traité individuellement : une erreur réseau persistante ou
+une page vide sur UN comité est loggée et ignorée, elle ne fait pas échouer
+tout le run (cf. résumé "comités vides / en erreur" en fin d'exécution). Le run
 entier échoue seulement si le total de clubs récupérés est trop bas
 (MIN_CLUBS) — dans ce cas, clubs.txt n'est PAS écrit, pour ne jamais publier
 un fichier tronqué comme release.
@@ -37,6 +41,7 @@ import sys
 import time
 import html
 import datetime
+import http.client
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -48,6 +53,13 @@ OUTPUT_FILE   = "clubs.txt"
 REQUEST_DELAY = 1.5   # secondes entre chaque requête HTTP — reste discret vis-à-vis de la FFE
 MAX_PAGES     = 20    # garde-fou anti-boucle-infinie par comité
 MIN_CLUBS     = 900   # la FFE annonce ~1007 clubs (juillet 2026) — seuil d'alerte si trop bas
+MAX_RETRIES   = 3     # tentatives par requête HTTP (erreur réseau, réponse tronquée, 5xx, 429)
+RETRY_DELAY   = 5     # secondes, multiplié par le n° de tentative (5s, 10s...)
+
+# Erreurs "réseau" : ne concernent qu'un comité, jamais tout le run.
+# http.client.HTTPException couvre les réponses tronquées (IncompleteRead,
+# RemoteDisconnected...) qui ne sont PAS des OSError et faisaient planter le run.
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException)
 
 
 def build_comite_codes():
@@ -91,10 +103,26 @@ def fetch(url: str, body: str = None, referer: str = None) -> str:
         data = body.encode("utf-8")
 
     req = urllib.request.Request(url, data=data, headers=headers)
-    with _opener.open(req, timeout=30) as resp:
-        raw = resp.read()
-        charset = resp.headers.get_content_charset() or "utf-8"
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with _opener.open(req, timeout=30) as resp:
+                raw = resp.read()
+                charset = resp.headers.get_content_charset() or "utf-8"
+            break
+        except NETWORK_ERRORS as e:
+            # 4xx (hors 429) : la requête elle-même est refusée, inutile d'insister
+            if isinstance(e, urllib.error.HTTPError) and e.code < 500 and e.code != 429:
+                raise
+            if attempt == MAX_RETRIES:
+                raise
+            wait = RETRY_DELAY * attempt
+            log(f"    ↻ {e!r} — nouvelle tentative {attempt + 1}/{MAX_RETRIES} dans {wait}s")
+            time.sleep(wait)
+
+    try:
         return raw.decode(charset, errors="replace")
+    except LookupError:  # charset annoncé par le serveur inconnu de Python
+        return raw.decode("utf-8", errors="replace")
 
 
 def extract_clubs(page_html: str) -> dict:
@@ -203,7 +231,7 @@ def main():
             else:
                 all_clubs.update(clubs)
             log(f"  [{i:>3}/{len(codes)}] Comité {code:>3} : {len(clubs):>4} clubs  (cumulé : {len(all_clubs)})")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except NETWORK_ERRORS as e:
             failed.append(code)
             log(f"  [{i:>3}/{len(codes)}] Comité {code:>3} : ❌ {e}")
         time.sleep(REQUEST_DELAY)
