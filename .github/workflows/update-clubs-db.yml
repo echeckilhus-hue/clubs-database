@@ -149,18 +149,26 @@ jobs:
         run: |
           TITLE="Clubs FFE - ${DATE}"
           NOTES="## Clubs FFE ${DATE} | Clubs: ${TOTAL} | Taille: ${SIZE}"
+          # Verification AVANT de supprimer l'ancienne release : si la creation est
+          # refusee (droits, API...), on s'arrete ici et l'ancienne reste en ligne.
+          PREFLIGHT="preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$PREFLIGHT" --draft --title "$PREFLIGHT" \
+            --notes "Verification des droits - brouillon supprime automatiquement"
+          gh release delete "$PREFLIGHT" --yes \
+            || echo "::warning::Brouillon $PREFLIGHT a supprimer a la main"
+
           if gh release view clubs-latest >/dev/null 2>&1; then
             gh release delete clubs-latest --yes --cleanup-tag
             sleep 3
           fi
           for i in 1 2 3; do
-            if gh release create clubs-latest --target "$GITHUB_SHA" \
-                 --title "$TITLE" --notes "$NOTES" --latest clubs.txt; then
+            if gh release create clubs-latest --title "$TITLE" --notes "$NOTES" --latest clubs.txt; then
               exit 0
             fi
             echo "Creation de la release echouee (tentative $i/3)"
             sleep 10
           done
+          echo "::error::clubs-latest supprimee mais impossible a recreer - relancer le workflow"
           exit 1
 
       # GitHub désactive les workflows planifiés d'un dépôt public après 60 jours
